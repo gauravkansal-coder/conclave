@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef } from "react";
-import { StyleSheet } from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { StyleSheet, type ListRenderItemInfo } from "react-native";
 import type { Participant } from "../types";
 import { TrueSheet } from "@lodev09/react-native-true-sheet";
 import { FlatList, Pressable, Text, View } from "@/tw";
+import { Check, X } from "lucide-react-native";
 import { SHEET_COLORS, SHEET_THEME } from "./true-sheet-theme";
 
 interface ParticipantsPanelProps {
@@ -13,8 +14,11 @@ interface ParticipantsPanelProps {
   onClose: () => void;
   pendingUsers?: Map<string, string>;
   isAdmin?: boolean;
+  hostUserId?: string | null;
+  hostUserIds?: string[];
   onAdmitPendingUser?: (userId: string) => void;
   onRejectPendingUser?: (userId: string) => void;
+  onPromoteHost?: (userId: string) => Promise<boolean> | boolean;
   visible?: boolean;
 }
 
@@ -26,12 +30,30 @@ export function ParticipantsPanel({
   onClose,
   pendingUsers,
   isAdmin = false,
+  hostUserId,
+  hostUserIds,
   onAdmitPendingUser,
   onRejectPendingUser,
+  onPromoteHost,
   visible = true,
 }: ParticipantsPanelProps) {
   const sheetRef = useRef<TrueSheet>(null);
   const hasPresented = useRef(false);
+  const [pendingPromoteUserId, setPendingPromoteUserId] = useState<string | null>(
+    null
+  );
+  const [promotingUserId, setPromotingUserId] = useState<string | null>(null);
+
+  const effectiveHostUserIds = useMemo(() => {
+    const effectiveHostUserId = hostUserId ?? (isAdmin ? currentUserId : null);
+    return new Set<string>(
+      hostUserIds && hostUserIds.length > 0
+        ? hostUserIds
+        : effectiveHostUserId
+          ? [effectiveHostUserId]
+          : []
+    );
+  }, [currentUserId, hostUserId, hostUserIds, isAdmin]);
 
   const handleDismiss = useCallback(() => {
     void sheetRef.current?.dismiss();
@@ -39,6 +61,8 @@ export function ParticipantsPanel({
 
   const handleDidDismiss = useCallback(() => {
     hasPresented.current = false;
+    setPendingPromoteUserId(null);
+    setPromotingUserId(null);
     onClose();
   }, [onClose]);
 
@@ -70,6 +94,139 @@ export function ParticipantsPanel({
     return Array.from(pendingUsers.entries());
   }, [pendingUsers]);
 
+  const beginHostPromotion = useCallback(
+    (userId: string) => {
+      if (!onPromoteHost || promotingUserId) return;
+      setPendingPromoteUserId(userId);
+    },
+    [onPromoteHost, promotingUserId]
+  );
+
+  const cancelHostPromotion = useCallback(() => {
+    if (promotingUserId) return;
+    setPendingPromoteUserId(null);
+  }, [promotingUserId]);
+
+  const confirmHostPromotion = useCallback(
+    async (userId: string) => {
+      if (!onPromoteHost) return;
+      setPromotingUserId(userId);
+      try {
+        await Promise.resolve(onPromoteHost(userId));
+      } finally {
+        setPromotingUserId(null);
+        setPendingPromoteUserId(null);
+      }
+    },
+    [onPromoteHost]
+  );
+
+  const keyExtractor = useCallback((item: Participant) => item.userId, []);
+
+  const renderParticipant = useCallback(
+    ({ item }: ListRenderItemInfo<Participant>) => {
+      const isYou = item.userId === currentUserId;
+      const isHost = effectiveHostUserIds.has(item.userId);
+      const statusParts: string[] = [];
+      if (item.isMuted) statusParts.push("Muted");
+      if (item.isCameraOff) statusParts.push("Cam Off");
+      if (item.isHandRaised) statusParts.push("✋");
+      const canPromote =
+        Boolean(onPromoteHost) &&
+        isAdmin &&
+        !isYou &&
+        !isHost &&
+        !item.isGhost;
+      const isPendingPromotion = pendingPromoteUserId === item.userId;
+      const isPromoting = promotingUserId === item.userId;
+
+      return (
+        <View style={styles.row}>
+          <View style={styles.rowLeft}>
+            <Text style={styles.nameText} numberOfLines={1}>
+              {resolveDisplayName(item.userId)}
+              {isYou ? (
+                <Text style={styles.youLabel}> (You)</Text>
+              ) : null}
+            </Text>
+            {isHost ? <Text style={styles.hostBadge}>Host</Text> : null}
+          </View>
+          <View style={styles.rowRight}>
+            {statusParts.length ? (
+              <Text style={styles.statusText}>
+                {statusParts.join(" · ")}
+              </Text>
+            ) : null}
+            {canPromote ? (
+              <View style={styles.promoteRow}>
+                {isPendingPromotion ? (
+                  <>
+                    <Pressable
+                      onPress={() => confirmHostPromotion(item.userId)}
+                      disabled={isPromoting}
+                      style={({ pressed }) => [
+                        styles.promoteButton,
+                        styles.promoteConfirm,
+                        pressed && styles.pendingButtonPressed,
+                        isPromoting && styles.promoteDisabled,
+                      ]}
+                      accessibilityRole="button"
+                      accessibilityLabel="Confirm host promotion"
+                    >
+                      <Text style={[styles.promoteText, styles.promoteConfirmText]}>
+                        {isPromoting ? "Promoting" : "Confirm"}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={cancelHostPromotion}
+                      disabled={isPromoting}
+                      style={({ pressed }) => [
+                        styles.promoteButton,
+                        styles.promoteCancel,
+                        pressed && styles.pendingButtonPressed,
+                        isPromoting && styles.promoteDisabled,
+                      ]}
+                      accessibilityRole="button"
+                      accessibilityLabel="Cancel host promotion"
+                    >
+                      <Text style={styles.promoteText}>Cancel</Text>
+                    </Pressable>
+                  </>
+                ) : (
+                  <Pressable
+                    onPress={() => beginHostPromotion(item.userId)}
+                    disabled={isPromoting}
+                    style={({ pressed }) => [
+                      styles.promoteButton,
+                      pressed && styles.pendingButtonPressed,
+                      isPromoting && styles.promoteDisabled,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Promote to host"
+                  >
+                    <Text style={styles.promoteText}>Host</Text>
+                  </Pressable>
+                )}
+              </View>
+            ) : null}
+          </View>
+        </View>
+      );
+    },
+    [
+      beginHostPromotion,
+      cancelHostPromotion,
+      confirmHostPromotion,
+      currentUserId,
+      effectiveHostUserIds,
+      isAdmin,
+      onPromoteHost,
+      pendingPromoteUserId,
+      promotingUserId,
+      resolveDisplayName,
+    ]
+  );
+
   useEffect(() => {
     if (visible) {
       hasPresented.current = true;
@@ -95,91 +252,71 @@ export function ParticipantsPanel({
       onDidDismiss={handleDidDismiss}
       {...SHEET_THEME}
     >
-      <View style={styles.sheetContent}>
-        <View style={styles.headerRow}>
-          <Text style={styles.headerText}>
-            Participants ({data.length})
-          </Text>
-          <Pressable onPress={handleDismiss} style={styles.closeButton}>
-            <Text style={styles.closeText}>Done</Text>
-          </Pressable>
-        </View>
-
-        {isAdmin && pendingList.length > 0 ? (
-          <View style={styles.pendingSection}>
-            <View style={styles.pendingHeader}>
-              <Text style={styles.pendingTitle}>
-                Waiting ({pendingList.length})
+      <FlatList
+        data={data}
+        keyExtractor={keyExtractor}
+        renderItem={renderParticipant}
+        contentContainerStyle={styles.sheetContent}
+        nestedScrollEnabled
+        keyboardShouldPersistTaps="handled"
+        ListHeaderComponent={
+          <>
+            <View style={styles.headerRow}>
+              <Text style={styles.headerText}>
+                Participants ({data.length})
               </Text>
+              <Pressable onPress={handleDismiss} style={styles.closeButton}>
+                <Text style={styles.closeText}>Done</Text>
+              </Pressable>
             </View>
-            <View style={styles.pendingList}>
-              {pendingList.map(([userId, displayName]) => (
-                <View key={userId} style={styles.pendingRow}>
-                  <Text style={styles.pendingName} numberOfLines={1}>
-                    {displayName || userId}
-                  </Text>
-                  <View style={styles.pendingActions}>
-                    <Pressable
-                      onPress={() => onRejectPendingUser?.(userId)}
-                      style={({ pressed }) => [
-                        styles.pendingIconButton,
-                        styles.pendingReject,
-                        pressed && styles.pendingButtonPressed,
-                      ]}
-                      accessibilityRole="button"
-                      accessibilityLabel="Reject"
-                    >
-                      <Text style={styles.pendingRejectIcon}>✕</Text>
-                    </Pressable>
-                    <Pressable
-                      onPress={() => onAdmitPendingUser?.(userId)}
-                      style={({ pressed }) => [
-                        styles.pendingIconButton,
-                        styles.pendingAdmit,
-                        pressed && styles.pendingButtonPressed,
-                      ]}
-                      accessibilityRole="button"
-                      accessibilityLabel="Admit"
-                    >
-                      <Text style={styles.pendingAdmitIcon}>✓</Text>
-                    </Pressable>
-                  </View>
-                </View>
-              ))}
-            </View>
-          </View>
-        ) : null}
 
-        <FlatList
-          data={data}
-          keyExtractor={(item) => item.userId}
-          contentContainerStyle={styles.listContent}
-          renderItem={({ item }) => {
-            const isYou = item.userId === currentUserId;
-            const statusParts: string[] = [];
-            if (item.isMuted) statusParts.push("Muted");
-            if (item.isCameraOff) statusParts.push("Cam Off");
-            if (item.isHandRaised) statusParts.push("✋");
-            return (
-              <View style={styles.row}>
-                <Text style={styles.nameText}>
-                  {resolveDisplayName(item.userId)}
-                  {isYou ? (
-                    <Text style={styles.youLabel}> (You)</Text>
-                  ) : null}
-                </Text>
-                <View style={styles.statusRow}>
-                  {statusParts.length ? (
-                    <Text style={styles.statusText}>
-                      {statusParts.join(" · ")}
-                    </Text>
-                  ) : null}
+            {isAdmin && pendingList.length > 0 ? (
+              <View style={styles.pendingSection}>
+                <View style={styles.pendingHeader}>
+                  <Text style={styles.pendingTitle}>
+                    Waiting ({pendingList.length})
+                  </Text>
+                </View>
+                <View style={styles.pendingList}>
+                  {pendingList.map(([userId, displayName]) => (
+                    <View key={userId} style={styles.pendingRow}>
+                      <Text style={styles.pendingName} numberOfLines={1}>
+                        {displayName || userId}
+                      </Text>
+                      <View style={styles.pendingActions}>
+                        <Pressable
+                          onPress={() => onRejectPendingUser?.(userId)}
+                          style={({ pressed }) => [
+                            styles.pendingIconButton,
+                            styles.pendingReject,
+                            pressed && styles.pendingButtonPressed,
+                          ]}
+                          accessibilityRole="button"
+                          accessibilityLabel="Reject"
+                        >
+                          <X size={15} color="rgba(248, 113, 113, 0.95)" strokeWidth={2.5} />
+                        </Pressable>
+                        <Pressable
+                          onPress={() => onAdmitPendingUser?.(userId)}
+                          style={({ pressed }) => [
+                            styles.pendingIconButton,
+                            styles.pendingAdmit,
+                            pressed && styles.pendingButtonPressed,
+                          ]}
+                          accessibilityRole="button"
+                          accessibilityLabel="Admit"
+                        >
+                          <Check size={15} color="#16a34a" strokeWidth={2.5} />
+                        </Pressable>
+                      </View>
+                    </View>
+                  ))}
                 </View>
               </View>
-            );
-          }}
-        />
-      </View>
+            ) : null}
+          </>
+        }
+      />
     </TrueSheet>
   );
 }
@@ -212,10 +349,6 @@ const styles = StyleSheet.create({
   closeText: {
     fontSize: 12,
     color: SHEET_COLORS.text,
-  },
-  listContent: {
-    gap: 12,
-    paddingBottom: 12,
   },
   pendingSection: {
     marginBottom: 12,
@@ -256,9 +389,9 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   pendingIconButton: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
+    width: 36,
+    height: 36,
+    borderRadius: 10,
     borderWidth: 1,
     alignItems: "center",
     justifyContent: "center",
@@ -270,16 +403,6 @@ const styles = StyleSheet.create({
   pendingAdmit: {
     borderColor: "rgba(249, 95, 74, 0.6)",
     backgroundColor: "rgba(249, 95, 74, 0.85)",
-  },
-  pendingRejectIcon: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "rgba(248, 113, 113, 0.95)",
-  },
-  pendingAdmitIcon: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#16a34a",
   },
   pendingButtonPressed: {
     opacity: 0.7,
@@ -296,9 +419,27 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
+  rowLeft: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   nameText: {
     fontSize: 14,
     color: SHEET_COLORS.text,
+  },
+  hostBadge: {
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    color: "rgba(249, 95, 74, 0.85)",
+    borderWidth: 1,
+    borderColor: "rgba(249, 95, 74, 0.35)",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 999,
   },
   youLabel: {
     color: "rgba(249, 95, 74, 0.8)",
@@ -313,5 +454,42 @@ const styles = StyleSheet.create({
   statusText: {
     fontSize: 12,
     color: SHEET_COLORS.textMuted,
+  },
+  rowRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  promoteRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  promoteButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: SHEET_COLORS.border,
+    backgroundColor: "rgba(254, 252, 217, 0.04)",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  promoteConfirm: {
+    borderColor: "rgba(249, 95, 74, 0.45)",
+    backgroundColor: "rgba(249, 95, 74, 0.12)",
+  },
+  promoteCancel: {
+    borderColor: "rgba(254, 252, 217, 0.2)",
+  },
+  promoteDisabled: {
+    opacity: 0.5,
+  },
+  promoteText: {
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+    color: SHEET_COLORS.textMuted,
+  },
+  promoteConfirmText: {
+    color: "rgba(249, 95, 74, 0.9)",
   },
 });

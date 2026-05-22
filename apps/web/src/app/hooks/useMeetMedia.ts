@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
+import type { Device } from "mediasoup-client";
 import {
   DEFAULT_AUDIO_CONSTRAINTS,
   LOW_QUALITY_CONSTRAINTS,
   OPUS_MAX_AVERAGE_BITRATE,
+  SCREEN_AUDIO_OPUS_MAX_AVERAGE_BITRATE,
   STANDARD_QUALITY_CONSTRAINTS,
 } from "../lib/constants";
 import type {
@@ -17,13 +19,16 @@ import type {
   VideoQuality,
 } from "../lib/types";
 import { createMeetError } from "../lib/utils";
+import { buildScreenShareEncoding } from "../lib/video-encodings";
 import {
-  buildWebcamSimulcastEncodings,
-  buildWebcamSingleLayerEncoding,
-} from "../lib/video-encodings";
+  getPreferredScreenShareCodec,
+  getPreferredWebcamCodec,
+  produceWebcamTrack,
+} from "../lib/webcam-codec";
 
 interface UseMeetMediaOptions {
   ghostEnabled: boolean;
+  isObserverMode?: boolean;
   connectionState: string;
   isMuted: boolean;
   setIsMuted: (value: boolean) => void;
@@ -43,10 +48,12 @@ interface UseMeetMediaOptions {
   videoQuality: VideoQuality;
   videoQualityRef: React.MutableRefObject<VideoQuality>;
   socketRef: React.MutableRefObject<Socket | null>;
+  deviceRef: React.MutableRefObject<Device | null>;
   producerTransportRef: React.MutableRefObject<Transport | null>;
   audioProducerRef: React.MutableRefObject<Producer | null>;
   videoProducerRef: React.MutableRefObject<Producer | null>;
   screenProducerRef: React.MutableRefObject<Producer | null>;
+  screenAudioProducerRef: React.MutableRefObject<Producer | null>;
   localStreamRef: React.MutableRefObject<MediaStream | null>;
   intentionalTrackStopsRef: React.MutableRefObject<
     WeakSet<MediaStreamTrack>
@@ -57,6 +64,7 @@ interface UseMeetMediaOptions {
 
 export function useMeetMedia({
   ghostEnabled,
+  isObserverMode = false,
   connectionState,
   isMuted,
   setIsMuted,
@@ -76,10 +84,12 @@ export function useMeetMedia({
   videoQuality,
   videoQualityRef,
   socketRef,
+  deviceRef,
   producerTransportRef,
   audioProducerRef,
   videoProducerRef,
   screenProducerRef,
+  screenAudioProducerRef,
   localStreamRef,
   intentionalTrackStopsRef,
   permissionHintTimeoutRef,
@@ -93,6 +103,9 @@ export function useMeetMedia({
   const updateVideoQualityRef = useRef<
     (quality: VideoQuality) => Promise<void>
   >(async () => {});
+  const audioRecoveryInFlightRef = useRef(false);
+  const cameraRecoveryInFlightRef = useRef(false);
+  const toggleMuteInFlightRef = useRef(false);
   const buildAudioConstraints = useCallback(
     (deviceId?: string): MediaTrackConstraints => ({
       ...DEFAULT_AUDIO_CONSTRAINTS,
@@ -117,40 +130,54 @@ export function useMeetMedia({
   }, [audioContextRef]);
 
   const playNotificationSound = useCallback(
-    (type: "join" | "leave" | "waiting") => {
+    (type: "join" | "leave" | "waiting" | "handRaise") => {
       const audioContext = getAudioContext();
       if (!audioContext) return;
 
+      const playPattern = () => {
+        const now = audioContext.currentTime;
+        const frequencies =
+          type === "join"
+            ? [523.25, 659.25]
+            : type === "waiting"
+            ? [440.0, 523.25, 659.25]
+            : type === "handRaise"
+            ? [587.33]
+            : [392.0, 261.63];
+        const duration =
+          type === "waiting" ? 0.1 : type === "handRaise" ? 0.12 : 0.12;
+        const gap = 0.03;
+        const peakGain = type === "handRaise" ? 0.13 : 0.16;
+
+        frequencies.forEach((frequency, index) => {
+          const start = now + index * (duration + gap);
+          const oscillator = audioContext.createOscillator();
+          const gain = audioContext.createGain();
+          oscillator.type = "sine";
+          oscillator.frequency.value = frequency;
+
+          gain.gain.setValueAtTime(0, start);
+          gain.gain.linearRampToValueAtTime(peakGain, start + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+          oscillator.connect(gain);
+          gain.connect(audioContext.destination);
+          oscillator.start(start);
+          oscillator.stop(start + duration + 0.02);
+        });
+      };
+
       if (audioContext.state === "suspended") {
-        audioContext.resume().catch(() => {});
+        audioContext
+          .resume()
+          .then(() => {
+            playPattern();
+          })
+          .catch(() => {});
+        return;
       }
 
-      const now = audioContext.currentTime;
-      const frequencies =
-        type === "join"
-          ? [523.25, 659.25]
-          : type === "waiting"
-          ? [440.0, 523.25, 659.25]
-          : [392.0, 261.63];
-      const duration = type === "waiting" ? 0.1 : 0.12;
-      const gap = 0.03;
-
-      frequencies.forEach((frequency, index) => {
-        const start = now + index * (duration + gap);
-        const oscillator = audioContext.createOscillator();
-        const gain = audioContext.createGain();
-        oscillator.type = "sine";
-        oscillator.frequency.value = frequency;
-
-        gain.gain.setValueAtTime(0, start);
-        gain.gain.linearRampToValueAtTime(0.16, start + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-
-        oscillator.connect(gain);
-        gain.connect(audioContext.destination);
-        oscillator.start(start);
-        oscillator.stop(start + duration + 0.02);
-      });
+      playPattern();
     },
     [getAudioContext]
   );
@@ -162,6 +189,56 @@ export function useMeetMedia({
       audioContext.resume().catch(() => {});
     }
   }, [getAudioContext]);
+
+  const emitToggleMute = useCallback(
+    (producerId: string, paused: boolean) => {
+      const socket = socketRef.current;
+      if (!socket || !socket.connected) {
+        return Promise.resolve({
+          ok: false,
+          error: "Socket not connected",
+        });
+      }
+
+      return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        let settled = false;
+        const timeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          resolve({ ok: false, error: "toggleMute timeout" });
+        }, 1500);
+
+        socket.emit(
+          "toggleMute",
+          { producerId, paused },
+          (response: { success: boolean } | { error: string }) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeout);
+            if ("error" in response) {
+              resolve({ ok: false, error: response.error });
+              return;
+            }
+            resolve({ ok: true });
+          }
+        );
+      });
+    },
+    [socketRef]
+  );
+
+  const resetAudioProducer = useCallback(
+    (producer: Producer | null) => {
+      if (!producer) return;
+      try {
+        producer.close();
+      } catch {}
+      if (audioProducerRef.current?.id === producer.id) {
+        audioProducerRef.current = null;
+      }
+    },
+    [audioProducerRef]
+  );
 
   const stopLocalTrack = useCallback(
     (track?: MediaStreamTrack | null) => {
@@ -453,7 +530,6 @@ export function useMeetMedia({
           };
           try {
             await currentTrack.applyConstraints(constraints);
-            return;
           } catch (err) {
             console.warn(
               "[Meets] applyConstraints failed, reopening camera:",
@@ -462,28 +538,69 @@ export function useMeetMedia({
           }
         }
 
-        const newStream = await navigator.mediaDevices.getUserMedia({
-          video: constraints,
+        let nextVideoTrack = localStream.getVideoTracks()[0];
+
+        if (!nextVideoTrack || nextVideoTrack.readyState !== "live") {
+          const newStream = await navigator.mediaDevices.getUserMedia({
+            video: constraints,
+          });
+          const newVideoTrack = newStream.getVideoTracks()[0];
+          if (!newVideoTrack) {
+            throw new Error("No video track obtained");
+          }
+          if ("contentHint" in newVideoTrack) {
+            newVideoTrack.contentHint = "motion";
+          }
+          newVideoTrack.onended = () => {
+            handleLocalTrackEnded("video", newVideoTrack);
+          };
+
+          const oldVideoTrack = localStream.getVideoTracks()[0];
+          if (oldVideoTrack) {
+            stopLocalTrack(oldVideoTrack);
+            localStream.removeTrack(oldVideoTrack);
+          }
+          localStream.addTrack(newVideoTrack);
+          setLocalStream(new MediaStream(localStream.getTracks()));
+          nextVideoTrack = newVideoTrack;
+        }
+
+        const transport = producerTransportRef.current;
+        const previousProducer = videoProducerRef.current;
+
+        if (!transport || !nextVideoTrack) {
+          return;
+        }
+
+        const preferredWebcamCodec = getPreferredWebcamCodec(deviceRef.current);
+        const nextProducer = await produceWebcamTrack({
+          transport,
+          track: nextVideoTrack,
+          quality,
+          paused: false,
+          preferredCodec: preferredWebcamCodec,
         });
-        const newVideoTrack = newStream.getVideoTracks()[0];
-        if (newVideoTrack && "contentHint" in newVideoTrack) {
-          newVideoTrack.contentHint = "motion";
-        }
-        newVideoTrack.onended = () => {
-          handleLocalTrackEnded("video", newVideoTrack);
-        };
 
-        const oldVideoTrack = localStream.getVideoTracks()[0];
-        if (oldVideoTrack) {
-          stopLocalTrack(oldVideoTrack);
-          localStream.removeTrack(oldVideoTrack);
-        }
-        localStream.addTrack(newVideoTrack);
-        setLocalStream(new MediaStream(localStream.getTracks()));
+        videoProducerRef.current = nextProducer;
+        const nextProducerId = nextProducer.id;
+        nextProducer.on("transportclose", () => {
+          if (videoProducerRef.current?.id === nextProducerId) {
+            videoProducerRef.current = null;
+          }
+        });
 
-        const producer = videoProducerRef.current;
-        if (producer) {
-          await producer.replaceTrack({ track: newVideoTrack });
+        if (
+          previousProducer &&
+          previousProducer.id !== nextProducerId
+        ) {
+          socketRef.current?.emit(
+            "closeProducer",
+            { producerId: previousProducer.id },
+            () => {}
+          );
+          try {
+            previousProducer.close();
+          } catch {}
         }
       } catch (err) {
         console.error("[Meets] Failed to update video quality:", err);
@@ -495,6 +612,9 @@ export function useMeetMedia({
       handleLocalTrackEnded,
       stopLocalTrack,
       setLocalStream,
+      socketRef,
+      deviceRef,
+      producerTransportRef,
       videoProducerRef,
     ]
   );
@@ -504,129 +624,174 @@ export function useMeetMedia({
   }, [updateVideoQuality]);
 
   const toggleMute = useCallback(async () => {
-    if (ghostEnabled) return;
+    if (ghostEnabled || isObserverMode) return;
+    if (toggleMuteInFlightRef.current) return;
+    toggleMuteInFlightRef.current = true;
     const previousMuted = isMuted;
     const nextMuted = !previousMuted;
-    // Optimistic UI update so mute/unmute reflects instantly.
-    setIsMuted(nextMuted);
-
     let producer = audioProducerRef.current;
-
-    if (producer && producer.track?.readyState !== "live") {
-      socketRef.current?.emit(
-        "closeProducer",
-        { producerId: producer.id },
-        () => {}
-      );
-      try {
-        producer.close();
-      } catch {}
-      audioProducerRef.current = null;
-      producer = null;
-    }
-
-    if (nextMuted) {
-      const currentTrack = localStreamRef.current?.getAudioTracks()[0];
-      if (currentTrack) {
-        stopLocalTrack(currentTrack);
-      }
-
-      setLocalStream((prev) => {
-        if (!prev) return prev;
-        const remaining = prev
-          .getTracks()
-          .filter((track) => track.kind !== "audio");
-        return new MediaStream(remaining);
-      });
-
-      if (producer) {
-        try {
-          await producer.replaceTrack({ track: null });
-        } catch (err) {
-          console.warn("[Meets] Failed to detach audio track:", err);
-        }
-        try {
-          producer.pause();
-        } catch {}
+    let createdTrack: MediaStreamTrack | null = null;
+    try {
+      if (
+        producer &&
+        (producer.closed || producer.track?.readyState !== "live")
+      ) {
         socketRef.current?.emit(
-          "toggleMute",
-          { producerId: producer.id, paused: true },
+          "closeProducer",
+          { producerId: producer.id },
           () => {}
         );
+        resetAudioProducer(producer);
+        producer = null;
       }
-      return;
-    }
 
-    try {
+      if (nextMuted) {
+        const currentTrack = localStreamRef.current?.getAudioTracks()[0];
+        if (currentTrack && currentTrack.readyState === "live") {
+          currentTrack.enabled = false;
+        }
+
+        if (producer) {
+          try {
+            producer.pause();
+          } catch {}
+          const toggleResult = await emitToggleMute(producer.id, true);
+          if (!toggleResult.ok) {
+            console.warn(
+              "[Meets] toggleMute failed, rolling back mute:",
+              toggleResult.error
+            );
+            if (currentTrack && currentTrack.readyState === "live") {
+              currentTrack.enabled = true;
+            }
+            try {
+              producer.resume();
+            } catch {}
+            setIsMuted(false);
+            setMeetError({
+              code: "TRANSPORT_ERROR",
+              message: toggleResult.error || "Failed to mute microphone",
+              recoverable: true,
+            });
+            return;
+          }
+        }
+        setIsMuted(true);
+        return;
+      }
+
       const transport = producerTransportRef.current;
       if (!transport) {
         setIsMuted(previousMuted);
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: buildAudioConstraints(selectedAudioInputDeviceId),
-      });
-      const audioTrack = stream.getAudioTracks()[0];
+      let audioTrack = localStreamRef.current?.getAudioTracks()[0] ?? null;
 
-      if (!audioTrack) throw new Error("No audio track obtained");
-      audioTrack.onended = () => {
-        handleLocalTrackEnded("audio", audioTrack);
-      };
+      if (audioTrack && audioTrack.readyState !== "live") {
+        stopLocalTrack(audioTrack);
+        audioTrack = null;
+      }
 
-      setLocalStream((prev) => {
-        if (prev) {
-          const newStream = new MediaStream(prev.getTracks());
-          newStream.getAudioTracks().forEach((t) => {
-            stopLocalTrack(t);
-            newStream.removeTrack(t);
-          });
-          newStream.addTrack(audioTrack);
-          return newStream;
-        }
-        return new MediaStream([audioTrack]);
-      });
+      if (!audioTrack) {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: buildAudioConstraints(selectedAudioInputDeviceId),
+        });
+        const nextAudioTrack = stream.getAudioTracks()[0];
+        createdTrack = nextAudioTrack ?? null;
+
+        if (!nextAudioTrack) throw new Error("No audio track obtained");
+        nextAudioTrack.onended = () => {
+          handleLocalTrackEnded("audio", nextAudioTrack);
+        };
+
+        setLocalStream((prev) => {
+          if (prev) {
+            const newStream = new MediaStream(prev.getTracks());
+            newStream.getAudioTracks().forEach((t) => {
+              if (t.id === nextAudioTrack.id) return;
+              stopLocalTrack(t);
+              newStream.removeTrack(t);
+            });
+            if (!newStream.getAudioTracks().some((t) => t.id === nextAudioTrack.id)) {
+              newStream.addTrack(nextAudioTrack);
+            }
+            return newStream;
+          }
+          return new MediaStream([nextAudioTrack]);
+        });
+
+        audioTrack = nextAudioTrack;
+      }
+
+      audioTrack.enabled = true;
 
       if (producer) {
-        await producer.replaceTrack({ track: audioTrack });
+        if (!producer.track || producer.track.id !== audioTrack.id) {
+          await producer.replaceTrack({ track: audioTrack });
+        }
         try {
           producer.resume();
         } catch {}
-        socketRef.current?.emit(
-          "toggleMute",
-          { producerId: producer.id, paused: false },
-          () => {}
-        );
-      } else {
+        const toggleResult = await emitToggleMute(producer.id, false);
+        if (!toggleResult.ok) {
+          console.warn(
+            "[Meets] toggleMute failed, restarting audio producer:",
+            toggleResult.error
+          );
+          resetAudioProducer(producer);
+          producer = null;
+        }
+      }
+
+      if (!producer) {
         const audioProducer = await transport.produce({
           track: audioTrack,
           codecOptions: {
             opusStereo: true,
             opusFec: true,
-            opusDtx: true,
+            opusDtx: false,
             opusMaxAverageBitrate: OPUS_MAX_AVERAGE_BITRATE,
           },
           appData: { type: "webcam" as ProducerType, paused: false },
         });
 
         audioProducerRef.current = audioProducer;
+        const audioProducerId = audioProducer.id;
         audioProducer.on("transportclose", () => {
-          audioProducerRef.current = null;
+          if (audioProducerRef.current?.id === audioProducerId) {
+            audioProducerRef.current = null;
+          }
         });
       }
+      setIsMuted(false);
     } catch (err) {
       console.error("[Meets] Failed to restart audio:", err);
+      if (createdTrack) {
+        stopLocalTrack(createdTrack);
+        setLocalStream((prev) => {
+          if (!prev) return prev;
+          const remaining = prev
+            .getTracks()
+            .filter((track) => track !== createdTrack && track.kind !== "audio");
+          return new MediaStream(remaining);
+        });
+      }
       setIsMuted(previousMuted);
       setMeetError(createMeetError(err, "MEDIA_ERROR"));
+    } finally {
+      toggleMuteInFlightRef.current = false;
     }
   }, [
     ghostEnabled,
+    isObserverMode,
     isMuted,
     selectedAudioInputDeviceId,
     handleLocalTrackEnded,
     stopLocalTrack,
     buildAudioConstraints,
     socketRef,
+    emitToggleMute,
     audioProducerRef,
     localStreamRef,
     setLocalStream,
@@ -634,10 +799,141 @@ export function useMeetMedia({
     setIsMuted,
     setMeetError,
     OPUS_MAX_AVERAGE_BITRATE,
+    resetAudioProducer,
+    toggleMuteInFlightRef,
+  ]);
+
+  useEffect(() => {
+    if (ghostEnabled || isObserverMode) return;
+    if (connectionState !== "joined") return;
+    if (isMuted) return;
+    if (audioProducerRef.current) {
+      const existingProducer = audioProducerRef.current;
+      if (
+        existingProducer.closed ||
+        existingProducer.track?.readyState !== "live"
+      ) {
+        resetAudioProducer(existingProducer);
+      } else {
+        return;
+      }
+    }
+    if (audioRecoveryInFlightRef.current) return;
+
+    const transport = producerTransportRef.current;
+    if (!transport) return;
+
+    let cancelled = false;
+    audioRecoveryInFlightRef.current = true;
+
+    const recoverAudioProducer = async () => {
+      let createdTrack: MediaStreamTrack | null = null;
+      try {
+        let audioTrack = localStreamRef.current?.getAudioTracks()[0] ?? null;
+
+        if (!audioTrack || audioTrack.readyState !== "live") {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: buildAudioConstraints(selectedAudioInputDeviceId),
+          });
+          audioTrack = stream.getAudioTracks()[0] ?? null;
+          createdTrack = audioTrack;
+        }
+
+        if (!audioTrack) {
+          throw new Error("No audio track available for recovery");
+        }
+
+        audioTrack.onended = () => {
+          handleLocalTrackEnded("audio", audioTrack);
+        };
+
+        if (createdTrack) {
+          setLocalStream((prev) => {
+            if (prev) {
+              const next = new MediaStream(prev.getTracks());
+              next.getAudioTracks().forEach((track) => {
+                stopLocalTrack(track);
+                next.removeTrack(track);
+              });
+              next.addTrack(audioTrack);
+              return next;
+            }
+            return new MediaStream([audioTrack]);
+          });
+        }
+
+        const audioProducer = await transport.produce({
+          track: audioTrack,
+          codecOptions: {
+            opusStereo: true,
+            opusFec: true,
+            opusDtx: false,
+            opusMaxAverageBitrate: OPUS_MAX_AVERAGE_BITRATE,
+          },
+          appData: { type: "webcam" as ProducerType, paused: false },
+        });
+
+        if (cancelled) {
+          try {
+            audioProducer.close();
+          } catch {}
+          return;
+        }
+
+        audioProducerRef.current = audioProducer;
+        audioProducer.on("transportclose", () => {
+          if (audioProducerRef.current?.id === audioProducer.id) {
+            audioProducerRef.current = null;
+          }
+        });
+      } catch (err) {
+        console.error("[Meets] Audio producer recovery failed:", err);
+        if (!cancelled) {
+          const existingAudioTracks = localStreamRef.current?.getAudioTracks() ?? [];
+          existingAudioTracks.forEach((track) => {
+            stopLocalTrack(track);
+          });
+          setLocalStream((prev) => {
+            if (!prev) return prev;
+            const remaining = prev
+              .getTracks()
+              .filter((track) => track.kind !== "audio");
+            return new MediaStream(remaining);
+          });
+          setIsMuted(true);
+          setMeetError(createMeetError(err, "MEDIA_ERROR"));
+        }
+      } finally {
+        audioRecoveryInFlightRef.current = false;
+      }
+    };
+
+    void recoverAudioProducer();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    ghostEnabled,
+    isObserverMode,
+    connectionState,
+    isMuted,
+    selectedAudioInputDeviceId,
+    handleLocalTrackEnded,
+    stopLocalTrack,
+    buildAudioConstraints,
+    producerTransportRef,
+    audioProducerRef,
+    localStreamRef,
+    setLocalStream,
+    setIsMuted,
+    setMeetError,
+    OPUS_MAX_AVERAGE_BITRATE,
+    resetAudioProducer,
   ]);
 
   const toggleCamera = useCallback(async () => {
-    if (ghostEnabled) return;
+    if (ghostEnabled || isObserverMode) return;
     const producer = videoProducerRef.current;
 
     if (producer) {
@@ -701,10 +997,12 @@ export function useMeetMedia({
     }
 
     if (isCameraOff) {
+      let createdTrack: MediaStreamTrack | null = null;
       try {
-        setIsCameraOff(false);
         const transport = producerTransportRef.current;
-        if (!transport) return;
+        if (!transport) {
+          throw new Error("Video transport unavailable");
+        }
 
         const stream = await navigator.mediaDevices.getUserMedia({
           video:
@@ -713,6 +1011,7 @@ export function useMeetMedia({
               : STANDARD_QUALITY_CONSTRAINTS,
         });
         const videoTrack = stream.getVideoTracks()[0];
+        createdTrack = videoTrack ?? null;
 
         if (!videoTrack) throw new Error("No video track obtained");
         if ("contentHint" in videoTrack) {
@@ -736,41 +1035,47 @@ export function useMeetMedia({
         });
 
         const quality = videoQualityRef.current;
-        let videoProducer;
-        try {
-          videoProducer = await transport.produce({
-            track: videoTrack,
-            encodings: buildWebcamSimulcastEncodings(quality),
-            appData: { type: "webcam" as ProducerType, paused: false },
-          });
-        } catch (simulcastError) {
-          console.warn(
-            "[Meets] Simulcast video restart failed, retrying single-layer:",
-            simulcastError
-          );
-          videoProducer = await transport.produce({
-            track: videoTrack,
-            encodings: [buildWebcamSingleLayerEncoding(quality)],
-            appData: { type: "webcam" as ProducerType, paused: false },
-          });
-        }
+        const preferredWebcamCodec = getPreferredWebcamCodec(deviceRef.current);
+        const videoProducer = await produceWebcamTrack({
+          transport,
+          track: videoTrack,
+          quality,
+          paused: false,
+          preferredCodec: preferredWebcamCodec,
+        });
 
         videoProducerRef.current = videoProducer;
+        const videoProducerId = videoProducer.id;
         videoProducer.on("transportclose", () => {
-          videoProducerRef.current = null;
+          if (videoProducerRef.current?.id === videoProducerId) {
+            videoProducerRef.current = null;
+          }
         });
+        setIsCameraOff(false);
       } catch (err) {
         console.error("[Meets] Failed to restart video:", err);
+        if (createdTrack) {
+          stopLocalTrack(createdTrack);
+          setLocalStream((prev) => {
+            if (!prev) return prev;
+            const remaining = prev
+              .getTracks()
+              .filter((track) => track !== createdTrack && track.kind !== "video");
+            return new MediaStream(remaining);
+          });
+        }
         setIsCameraOff(true);
         setMeetError(createMeetError(err, "MEDIA_ERROR"));
       }
     }
   }, [
     ghostEnabled,
+    isObserverMode,
     isCameraOff,
     handleLocalTrackEnded,
     stopLocalTrack,
     socketRef,
+    deviceRef,
     videoProducerRef,
     producerTransportRef,
     setLocalStream,
@@ -779,10 +1084,133 @@ export function useMeetMedia({
     setMeetError,
   ]);
 
+  useEffect(() => {
+    if (ghostEnabled || isObserverMode) return;
+    if (connectionState !== "joined") return;
+    if (isCameraOff) return;
+    if (videoProducerRef.current) return;
+    if (cameraRecoveryInFlightRef.current) return;
+
+    const transport = producerTransportRef.current;
+    if (!transport) return;
+
+    let cancelled = false;
+    cameraRecoveryInFlightRef.current = true;
+
+    const recoverCameraProducer = async () => {
+      let createdTrack: MediaStreamTrack | null = null;
+      try {
+        let videoTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+
+        if (!videoTrack || videoTrack.readyState !== "live") {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video:
+              videoQualityRef.current === "low"
+                ? LOW_QUALITY_CONSTRAINTS
+                : STANDARD_QUALITY_CONSTRAINTS,
+          });
+          videoTrack = stream.getVideoTracks()[0] ?? null;
+          createdTrack = videoTrack;
+        }
+
+        if (!videoTrack) {
+          throw new Error("No video track available for recovery");
+        }
+
+        if ("contentHint" in videoTrack) {
+          videoTrack.contentHint = "motion";
+        }
+        videoTrack.onended = () => {
+          handleLocalTrackEnded("video", videoTrack);
+        };
+
+        if (createdTrack) {
+          setLocalStream((prev) => {
+            if (prev) {
+              prev.getVideoTracks().forEach((track) => {
+                stopLocalTrack(track);
+              });
+              const remaining = prev
+                .getTracks()
+                .filter((track) => track.kind !== "video");
+              return new MediaStream([...remaining, videoTrack]);
+            }
+            return new MediaStream([videoTrack]);
+          });
+        }
+
+        const quality = videoQualityRef.current;
+        const preferredWebcamCodec = getPreferredWebcamCodec(deviceRef.current);
+        const recoveredProducer = await produceWebcamTrack({
+          transport,
+          track: videoTrack,
+          quality,
+          paused: false,
+          preferredCodec: preferredWebcamCodec,
+        });
+
+        if (cancelled) {
+          try {
+            recoveredProducer.close();
+          } catch {}
+          return;
+        }
+
+        videoProducerRef.current = recoveredProducer;
+        recoveredProducer.on("transportclose", () => {
+          if (videoProducerRef.current?.id === recoveredProducer.id) {
+            videoProducerRef.current = null;
+          }
+        });
+      } catch (err) {
+        console.error("[Meets] Camera producer recovery failed:", err);
+        if (!cancelled) {
+          const existingVideoTracks = localStreamRef.current?.getVideoTracks() ?? [];
+          existingVideoTracks.forEach((track) => {
+            stopLocalTrack(track);
+          });
+          setLocalStream((prev) => {
+            if (!prev) return prev;
+            const remaining = prev
+              .getTracks()
+              .filter((track) => track.kind !== "video");
+            return new MediaStream(remaining);
+          });
+          setIsCameraOff(true);
+          setMeetError(createMeetError(err, "MEDIA_ERROR"));
+        }
+      } finally {
+        cameraRecoveryInFlightRef.current = false;
+      }
+    };
+
+    void recoverCameraProducer();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    ghostEnabled,
+    isObserverMode,
+    connectionState,
+    isCameraOff,
+    handleLocalTrackEnded,
+    stopLocalTrack,
+    setLocalStream,
+    setIsCameraOff,
+    setMeetError,
+    producerTransportRef,
+    deviceRef,
+    videoProducerRef,
+    localStreamRef,
+    videoQualityRef,
+  ]);
+
   const toggleScreenShare = useCallback(async () => {
-    if (ghostEnabled) return;
+    if (ghostEnabled || isObserverMode) return;
     if (isScreenSharing) {
       const producer = screenProducerRef.current;
+      const audioProducer = screenAudioProducerRef.current;
       if (producer) {
         socketRef.current?.emit(
           "closeProducer",
@@ -797,6 +1225,20 @@ export function useMeetMedia({
         }
       }
       screenProducerRef.current = null;
+      if (audioProducer) {
+        socketRef.current?.emit(
+          "closeProducer",
+          { producerId: audioProducer.id },
+          () => {}
+        );
+        try {
+          audioProducer.close();
+        } catch {}
+        if (audioProducer.track) {
+          audioProducer.track.onended = null;
+        }
+      }
+      screenAudioProducerRef.current = null;
       setIsScreenSharing(false);
       return;
     }
@@ -817,9 +1259,9 @@ export function useMeetMedia({
       const videoConstraints: MediaTrackConstraints & {
         cursor?: "always" | "motion" | "never";
       } = {
-        frameRate: { ideal: 30, max: 60 },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+        width: { ideal: 1920, max: 3840 },
+        height: { ideal: 1080, max: 2160 },
         cursor: "always",
       };
 
@@ -832,14 +1274,58 @@ export function useMeetMedia({
         track.contentHint = "detail";
       }
 
+      const preferredScreenShareCodec = getPreferredScreenShareCodec(
+        deviceRef.current,
+      );
       const producer = await transport.produce({
         track,
-        encodings: [{ maxBitrate: 2500000 }],
+        encodings: [buildScreenShareEncoding()],
+        ...(preferredScreenShareCodec ? { codec: preferredScreenShareCodec } : {}),
         appData: { type: "screen" as ProducerType },
       });
 
       screenProducerRef.current = producer;
       setIsScreenSharing(true);
+
+      const audioTrack = stream.getAudioTracks()[0];
+      if (audioTrack && audioTrack.readyState === "live") {
+        try {
+          const audioProducer = await transport.produce({
+            track: audioTrack,
+            codecOptions: {
+              opusStereo: true,
+              opusFec: true,
+              opusDtx: false,
+              opusMaxAverageBitrate: SCREEN_AUDIO_OPUS_MAX_AVERAGE_BITRATE,
+            },
+            appData: { type: "screen" as ProducerType },
+          });
+
+          screenAudioProducerRef.current = audioProducer;
+          const audioProducerId = audioProducer.id;
+          audioProducer.on("transportclose", () => {
+            if (screenAudioProducerRef.current?.id === audioProducerId) {
+              screenAudioProducerRef.current = null;
+            }
+          });
+
+          audioTrack.onended = () => {
+            socketRef.current?.emit(
+              "closeProducer",
+              { producerId: audioProducer.id },
+              () => {}
+            );
+            try {
+              audioProducer.close();
+            } catch {}
+            if (screenAudioProducerRef.current?.id === audioProducer.id) {
+              screenAudioProducerRef.current = null;
+            }
+          };
+        } catch (audioErr) {
+          console.warn("[Meets] Failed to share screen audio:", audioErr);
+        }
+      }
 
       track.onended = () => {
         socketRef.current?.emit(
@@ -851,6 +1337,21 @@ export function useMeetMedia({
           producer.close();
         } catch {}
         screenProducerRef.current = null;
+        const currentAudioProducer = screenAudioProducerRef.current;
+        if (currentAudioProducer) {
+          socketRef.current?.emit(
+            "closeProducer",
+            { producerId: currentAudioProducer.id },
+            () => {}
+          );
+          try {
+            currentAudioProducer.close();
+          } catch {}
+          if (currentAudioProducer.track) {
+            currentAudioProducer.track.onended = null;
+          }
+          screenAudioProducerRef.current = null;
+        }
         setIsScreenSharing(false);
       };
     } catch (err) {
@@ -863,13 +1364,16 @@ export function useMeetMedia({
     }
   }, [
     ghostEnabled,
+    isObserverMode,
     isScreenSharing,
     activeScreenShareId,
     setIsScreenSharing,
     producerTransportRef,
     screenProducerRef,
+    screenAudioProducerRef,
     socketRef,
     setMeetError,
+    OPUS_MAX_AVERAGE_BITRATE,
   ]);
 
   useEffect(() => {

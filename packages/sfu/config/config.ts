@@ -1,9 +1,53 @@
 import dotenv from "dotenv";
 import path from "path";
+import { existsSync } from "fs";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, "../.env") });
+const sfuPackageRoot = path.resolve(__dirname, "..");
+const repoRoot = path.resolve(sfuPackageRoot, "..", "..");
+const webAppRoot = path.resolve(repoRoot, "apps", "web");
+
+// First match wins (dotenv default does not override existing process.env vars).
+// Order: most-specific (sfu package) → shared web app (matches Next.js) → repo root.
+// This keeps local dev in sync without forcing the user to maintain duplicate secrets.
+const envCandidates = [
+  path.join(sfuPackageRoot, ".env.local"),
+  path.join(sfuPackageRoot, ".env"),
+  path.join(webAppRoot, ".env.local"),
+  path.join(webAppRoot, ".env"),
+  path.join(repoRoot, ".env.local"),
+  path.join(repoRoot, ".env"),
+];
+
+const initialSecretFromProcess = process.env.SFU_SECRET;
+const loadedEnvFiles: string[] = [];
+let secretSource: string = initialSecretFromProcess
+  ? "process.env (set before SFU bootstrap)"
+  : "fallback literal";
+
+for (const envPath of envCandidates) {
+  if (existsSync(envPath)) {
+    const beforeSecret = process.env.SFU_SECRET;
+    dotenv.config({ path: envPath });
+    loadedEnvFiles.push(envPath);
+    if (!beforeSecret && process.env.SFU_SECRET) {
+      secretSource = envPath;
+    }
+  }
+}
+
+const sfuSecretFingerprint = (() => {
+  const value = process.env.SFU_SECRET || "development-secret";
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+})();
+
+if (process.env.SFU_DEBUG_SECRET !== "0") {
+  console.log(
+    `[SFU env] loaded ${loadedEnvFiles.length} file(s); SFU_SECRET source: ${secretSource}; fingerprint: ${sfuSecretFingerprint}`,
+  );
+}
 
 const toNumber = (value: string | undefined, fallback: number): number => {
   if (!value) return fallback;
@@ -82,6 +126,23 @@ const clientPolicies = normalizeClientPolicies(
   process.env.SFU_CLIENT_POLICIES,
 );
 
+const resolveAnnouncedIp = (): string => {
+  const announcedIp = process.env.ANNOUNCED_IP?.trim();
+  if (announcedIp) return announcedIp;
+
+  if (process.env.NODE_ENV === "production") {
+    console.warn(
+      "[SFU] ANNOUNCED_IP is not set. Falling back to 127.0.0.1, which is not reachable for remote clients.",
+    );
+  }
+
+  return "127.0.0.1";
+};
+
+const announcedIp = resolveAnnouncedIp();
+const plainTransportAnnouncedIp =
+  process.env.PLAIN_TRANSPORT_ANNOUNCED_IP?.trim() || announcedIp;
+
 export const config = {
   port: toNumber(process.env.SFU_PORT || process.env.PORT, 3031),
   instanceId: process.env.SFU_INSTANCE_ID || `sfu-${process.pid}`,
@@ -91,14 +152,14 @@ export const config = {
   clientPolicies,
   workerSettings: {
     rtcMinPort: toNumber(process.env.RTC_MIN_PORT, 40000),
-    rtcMaxPort: toNumber(process.env.RTC_MAX_PORT, 41000),
+    rtcMaxPort: toNumber(process.env.RTC_MAX_PORT, 49999),
     logLevel: "warn" as WorkerLogLevel,
     logTags: ["info", "ice", "dtls", "rtp", "srtp", "rtcp"] as WorkerLogTag[],
   },
   videoQuality: {
-    lowThreshold: Number(process.env.VIDEO_QUALITY_LOW_THRESHOLD) || 10,
+    lowThreshold: Number(process.env.VIDEO_QUALITY_LOW_THRESHOLD) || 1000,
     standardThreshold:
-      Number(process.env.VIDEO_QUALITY_STANDARD_THRESHOLD) || 8,
+      Number(process.env.VIDEO_QUALITY_STANDARD_THRESHOLD) || 900,
   },
   adminCleanupTimeout: Number(process.env.ADMIN_CLEANUP_TIMEOUT) || 120000,
   socket: {
@@ -144,16 +205,21 @@ export const config = {
     listenIps: [
       {
         ip: "0.0.0.0",
-        announcedIp: process.env.ANNOUNCED_IP || "172.16.22.196",
+        announcedIp,
       },
     ],
-    maxIncomingBitrate: 1500000,
-    initialAvailableOutgoingBitrate: 1000000,
+    maxIncomingBitrate: toNumber(
+      process.env.SFU_WEBRTC_MAX_INCOMING_BITRATE,
+      25000000,
+    ),
+    initialAvailableOutgoingBitrate: toNumber(
+      process.env.SFU_WEBRTC_INITIAL_OUTGOING_BITRATE,
+      25000000,
+    ),
   },
   plainTransport: {
     listenIp: process.env.PLAIN_TRANSPORT_LISTEN_IP || "0.0.0.0",
-    announcedIp:
-      process.env.PLAIN_TRANSPORT_ANNOUNCED_IP || process.env.ANNOUNCED_IP,
+    announcedIp: plainTransportAnnouncedIp,
   },
 };
 

@@ -1,9 +1,11 @@
 "use client";
 
 import { Ghost, Hand, Info, MicOff } from "lucide-react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
+import { createPlaybackRecoveryScheduler } from "../lib/playback-recovery";
 import type { Participant } from "../lib/types";
 import { truncateDisplayName } from "../lib/utils";
+import ParticipantAudio from "./ParticipantAudio";
 
 interface ParticipantVideoProps {
   participant: Participant;
@@ -14,6 +16,11 @@ interface ParticipantVideoProps {
   isAdmin?: boolean;
   isSelected?: boolean;
   onAdminClick?: (userId: string) => void;
+  videoObjectFit?: "cover" | "contain";
+  onAudioAutoplayBlocked?: () => void;
+  onAudioPlaybackStarted?: () => void;
+  audioPlaybackAttemptToken?: number;
+  disableAudio?: boolean;
 }
 
 function ParticipantVideo({
@@ -25,9 +32,13 @@ function ParticipantVideo({
   isAdmin = false,
   isSelected = false,
   onAdminClick,
+  videoObjectFit = "cover",
+  onAudioAutoplayBlocked,
+  onAudioPlaybackStarted,
+  audioPlaybackAttemptToken,
+  disableAudio = false,
 }: ParticipantVideoProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
   const [isNew, setIsNew] = useState(true);
   const labelWidthClass = compact ? "max-w-[65%]" : "max-w-[75%]";
   const displayLabel = truncateDisplayName(displayName, compact ? 12 : 18);
@@ -37,59 +48,92 @@ function ParticipantVideo({
     return () => clearTimeout(timer);
   }, []);
 
-  const setVideoRef = useCallback(
-    (node: HTMLVideoElement | null) => {
-      if (node && participant.videoStream) {
-        node.srcObject = participant.videoStream;
-        node.play().catch((err) => {
-          if (err.name !== "AbortError") {
-            console.error("[Meets] Video play error:", err);
-          }
-        });
-      }
-      videoRef.current = node;
-    },
-    [participant.videoStream]
-  );
-
-  const setAudioRef = useCallback(
-    (node: HTMLAudioElement | null) => {
-      if (node && participant.audioStream) {
-        node.srcObject = participant.audioStream;
-        node.play().catch((err) => {
-          if (err.name !== "AbortError") {
-            console.error("[Meets] Audio play error:", err);
-          }
-        });
-
-        if (audioOutputDeviceId) {
-          const audioElement = node as HTMLAudioElement & {
-            setSinkId?: (sinkId: string) => Promise<void>;
-          };
-          if (audioElement.setSinkId) {
-            audioElement.setSinkId(audioOutputDeviceId).catch((err) => {
-              console.error("[Meets] Failed to set audio output:", err);
-            });
-          }
-        }
-      }
-      audioRef.current = node;
-    },
-    [participant.audioStream, audioOutputDeviceId]
-  );
-
   useEffect(() => {
-    if (audioRef.current && audioOutputDeviceId) {
-      const audioElement = audioRef.current as HTMLAudioElement & {
-        setSinkId?: (sinkId: string) => Promise<void>;
-      };
-      if (audioElement.setSinkId) {
-        audioElement.setSinkId(audioOutputDeviceId).catch((err) => {
-          console.error("[Meets] Failed to update audio output:", err);
-        });
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (!participant.videoStream || participant.isCameraOff) {
+      if (video.srcObject) {
+        video.srcObject = null;
       }
+      return;
     }
-  }, [audioOutputDeviceId]);
+
+    if (video.srcObject !== participant.videoStream) {
+      video.srcObject = participant.videoStream;
+    }
+
+    let cancelled = false;
+
+    const playVideo = () => {
+      if (cancelled) return;
+      video.play().catch((err) => {
+        if (err.name !== "AbortError") {
+          if (err.name === "NotAllowedError") {
+            video.muted = true;
+            video.play().catch(() => {});
+            return;
+          }
+          console.error("[Meets] Video play error:", err);
+        }
+      });
+    };
+
+    const playbackRecovery = createPlaybackRecoveryScheduler({
+      attemptPlayback: playVideo,
+      shouldAttemptAnimationFrameReplay: () =>
+        !cancelled &&
+        (video.paused ||
+          video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA),
+    });
+    const scheduleReplay = playbackRecovery.schedule;
+
+    scheduleReplay();
+
+    const videoTrack = participant.videoStream.getVideoTracks()[0];
+    const handleTrackUnmuted = () => {
+      scheduleReplay();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        scheduleReplay();
+      }
+    };
+    const handleResize = () => {
+      scheduleReplay();
+    };
+    const handleOrientationChange = () => {
+      scheduleReplay();
+    };
+
+    if (videoTrack) {
+      videoTrack.addEventListener("unmute", handleTrackUnmuted);
+    }
+    video.addEventListener("loadedmetadata", scheduleReplay);
+    video.addEventListener("loadeddata", scheduleReplay);
+    video.addEventListener("canplay", scheduleReplay);
+    video.addEventListener("stalled", scheduleReplay);
+    video.addEventListener("suspend", scheduleReplay);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("orientationchange", handleOrientationChange);
+
+    return () => {
+      cancelled = true;
+      if (videoTrack) {
+        videoTrack.removeEventListener("unmute", handleTrackUnmuted);
+      }
+      video.removeEventListener("loadedmetadata", scheduleReplay);
+      video.removeEventListener("loadeddata", scheduleReplay);
+      video.removeEventListener("canplay", scheduleReplay);
+      video.removeEventListener("stalled", scheduleReplay);
+      video.removeEventListener("suspend", scheduleReplay);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("orientationchange", handleOrientationChange);
+      playbackRecovery.clear();
+    };
+  }, [participant.videoStream, participant.videoProducerId, participant.isCameraOff]);
 
   const showPlaceholder = !participant.videoStream || participant.isCameraOff;
 
@@ -101,6 +145,9 @@ function ParticipantVideo({
 
   const speakerHighlight = isActiveSpeaker 
     ? "speaking" 
+    : "";
+  const handRaisedHighlight = participant.isHandRaised
+    ? "border-amber-400/45 shadow-[0_0_22px_rgba(251,191,36,0.24)]"
     : "";
 
   return (
@@ -115,15 +162,20 @@ function ParticipantVideo({
           ? "animate-participant-leave"
           : ""
       } ${speakerHighlight} ${
+        handRaisedHighlight
+      } ${
         isAdmin && onAdminClick ? "cursor-pointer hover:border-[#F95F4A]/40" : ""
       }`}
       style={{ fontFamily: "'PolySans Trial', sans-serif" }}
     >
       <video
-        ref={setVideoRef}
+        ref={videoRef}
         autoPlay
+        muted
         playsInline
-        className={`w-full h-full object-cover ${
+        className={`w-full h-full ${
+          videoObjectFit === "contain" ? "object-contain bg-black" : "object-cover"
+        } ${
           showPlaceholder ? "hidden" : ""
         }`}
       />
@@ -160,7 +212,15 @@ function ParticipantVideo({
           </div>
         </div>
       )}
-      <audio ref={setAudioRef} autoPlay />
+      {!disableAudio && (
+        <ParticipantAudio
+          participant={participant}
+          audioOutputDeviceId={audioOutputDeviceId}
+          onAudioAutoplayBlocked={onAudioAutoplayBlocked}
+          onAudioPlaybackStarted={onAudioPlaybackStarted}
+          audioPlaybackAttemptToken={audioPlaybackAttemptToken}
+        />
+      )}
       {participant.isHandRaised && (
         <div
           className={`absolute top-3 left-3 rounded-full bg-amber-500/20 border border-amber-400/40 text-amber-300 shadow-[0_0_15px_rgba(251,191,36,0.3)] ${

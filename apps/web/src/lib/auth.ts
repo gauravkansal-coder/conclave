@@ -1,15 +1,19 @@
 import { betterAuth } from "better-auth";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
+const appleAppBundleIdentifier =
+  process.env.APPLE_APP_BUNDLE_IDENTIFIER ||
+  process.env.APPLE_APP_BUNDLE_ID ||
+  "com.acmvit.conclave";
+
 const appleProvider =
   process.env.APPLE_CLIENT_ID && process.env.APPLE_CLIENT_SECRET
     ? {
         apple: {
           clientId: process.env.APPLE_CLIENT_ID,
           clientSecret: process.env.APPLE_CLIENT_SECRET,
-          appBundleIdentifier:
-            process.env.APPLE_APP_BUNDLE_IDENTIFIER ||
-            process.env.APPLE_APP_BUNDLE_ID,
+          appBundleIdentifier: appleAppBundleIdentifier,
+          audience: [process.env.APPLE_CLIENT_ID, appleAppBundleIdentifier],
         },
       }
     : {};
@@ -40,10 +44,15 @@ const googleJwks = createRemoteJWKSet(
 
 export const auth = betterAuth({
   session: {
-    expiresIn: 60 * 60 * 24 * 7, 
+    expiresIn: 60 * 60 * 24 * 7,
     cookieCache: {
       enabled: true,
-      maxAge: 60 * 5,
+      maxAge: 60,
+    },
+  },
+  user: {
+    deleteUser: {
+      enabled: true,
     },
   },
 

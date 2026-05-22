@@ -1,7 +1,8 @@
 "use client";
 
-import { Ghost, Globe, Hand, Loader2 } from "lucide-react";
+import { Ghost, Globe, Hand, Loader2, Mic, MicOff } from "lucide-react";
 import { memo, useEffect, useRef, useState, type FormEvent } from "react";
+import { useSmartParticipantOrder } from "../hooks/useSmartParticipantOrder";
 import type { Participant } from "../lib/types";
 import {
     getSpeakerHighlightClasses,
@@ -17,6 +18,7 @@ interface BrowserLayoutProps {
     controllerName: string;
     localStream: MediaStream | null;
     isCameraOff: boolean;
+    isMuted: boolean;
     isHandRaised: boolean;
     isGhost: boolean;
     participants: Map<string, Participant>;
@@ -38,6 +40,7 @@ function BrowserLayout({
     controllerName,
     localStream,
     isCameraOff,
+    isMuted,
     isHandRaised,
     isGhost,
     participants,
@@ -108,9 +111,15 @@ function BrowserLayout({
     })();
 
     const resolvedNoVncUrl = resolveNoVncUrl(noVncUrl);
+    const remoteParticipants = useSmartParticipantOrder(
+        Array.from(participants.values()).filter(
+            (participant) => !isSystemUserId(participant.userId)
+        ),
+        activeSpeakerId
+    );
 
     return (
-        <div className="flex flex-1 min-h-0 min-w-0 gap-4 overflow-hidden">
+        <div className="mt-5 flex flex-1 min-h-0 min-w-0 gap-4 overflow-hidden">
             <div className="flex-1 min-h-0 min-w-0 bg-[#252525] border border-white/5 rounded-lg overflow-hidden relative flex flex-col">
                 {isAdmin && onNavigateBrowser && (
                     <div className="px-3 py-2 bg-black/50 border-b border-white/5">
@@ -270,12 +279,15 @@ function BrowserLayout({
                         style={{ fontFamily: "'PolySans Mono', monospace" }}
                     >
                         <span className="font-medium text-[#FEFCD9] uppercase tracking-wide">You</span>
+                        {isMuted ? (
+                            <MicOff className="w-3 h-3 text-[#F95F4A]" />
+                        ) : (
+                            <Mic className="w-3 h-3 text-emerald-300" />
+                        )}
                     </div>
                 </div>
 
-                {Array.from(participants.values())
-                    .filter((participant) => !isSystemUserId(participant.userId))
-                    .map((participant) => (
+                {remoteParticipants.map((participant) => (
                         <ParticipantVideo
                             key={participant.userId}
                             participant={participant}

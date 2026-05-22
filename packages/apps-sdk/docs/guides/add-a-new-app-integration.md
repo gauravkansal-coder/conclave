@@ -2,6 +2,23 @@
 
 This guide shows how to add a new in-meeting app to the Conclave Apps SDK integration (web + native), using the current whiteboard wiring as the reference pattern.
 
+## Fast path: scaffold first
+
+Instead of creating files manually, scaffold an app shell:
+
+```bash
+pnpm -C packages/apps-sdk run new:app polls
+```
+
+Useful options:
+
+- `--name "Polls"` to set display name
+- `--description "Live polls"` to set app description
+- `--no-native` or `--no-web` for platform-specific apps
+- `--dry-run` to preview changes without writing files
+
+The scaffold command creates core/web/native files (as requested), updates `packages/apps-sdk/package.json` exports, and adds explicit aliases to `apps/mobile/tsconfig.json`.
+
 ## What "integration" means in this repo
 
 You need to wire the app in five places:
@@ -11,6 +28,8 @@ You need to wire the app in five places:
 3. Native host (`apps/mobile`): register app + render UI.
 4. Meeting controls/layouts: open, close, and lock the app via `useApps()`.
 5. SFU socket handlers (`packages/sfu`): already generic, usually no per-app code needed.
+
+Before starting, confirm your app id and keep it unchanged. Most integration bugs are id mismatch issues.
 
 ## 1. Add app files in `packages/apps-sdk`
 
@@ -42,6 +61,17 @@ export const createPollsDoc = () => {
   }
   return doc;
 };
+```
+
+Or use the built-in helper:
+
+```ts
+import { createAppDoc, ensureAppMap } from "@conclave/apps-sdk";
+
+export const createPollsDoc = () =>
+  createAppDoc("polls", (root) => {
+    ensureAppMap(root, "meta");
+  });
 ```
 
 Define app entries (web and native) with the same `id`:
@@ -208,6 +238,8 @@ No app-specific SFU handler is typically required. The handlers in `packages/sfu
 
 Keep `registerAppsHandlers(context)` wired in `packages/sfu/server/socket/registerConnectionHandlers.ts`.
 
+You only need server customization if your app requires behavior beyond generic state/sync/awareness relay (for example, custom media control arbitration).
+
 ## 9. Verification checklist
 
 1. Admin can open and close the new app on web and mobile.
@@ -217,6 +249,9 @@ Keep `registerAppsHandlers(context)` wired in `packages/sfu/server/socket/regist
 5. Lock mode prevents edits for non-admins.
 6. Reconnect preserves current app state (`refreshState` + sync path).
 7. Asset upload path works (if used).
+8. `pnpm -C packages/apps-sdk run check:apps` passes.
+
+If exports/paths drift, run `pnpm -C packages/apps-sdk run check:apps:fix`.
 
 ## Common pitfalls
 
@@ -224,3 +259,14 @@ Keep `registerAppsHandlers(context)` wired in `packages/sfu/server/socket/regist
 - Forgetting mobile TS path aliases for new package subpaths.
 - Using `useApps`/`useAppDoc` outside `AppsProvider`.
 - Registering app only on one platform and expecting it on both.
+- Treating awareness as persistent data.
+
+## Related docs
+
+- [Docs Home](../README.md)
+- [Core Concepts](../reference/core-concepts.md)
+- [Runtime APIs and Hooks](../reference/runtime-apis.md)
+- [Permissions and Locking](../reference/permissions-and-locking.md)
+- [Socket Events and Sync](../reference/socket-events-and-sync.md)
+- [Troubleshooting](./troubleshooting.md)
+- [App Cookbook](./app-cookbook.md)

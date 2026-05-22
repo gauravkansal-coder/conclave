@@ -47,12 +47,34 @@ export interface JoinRoomData {
   sessionId?: string;
   displayName?: string;
   ghost?: boolean;
+  recorder?: boolean;
+  webinarInviteCode?: string;
+  meetingInviteCode?: string;
 }
 
 export interface JoinRoomResponse {
+  roomId?: string;
   rtpCapabilities: RtpCapabilities;
   existingProducers: ProducerInfo[];
   status?: "waiting" | "joined";
+  hostUserId?: string | null;
+  hostUserIds?: string[];
+  isLocked?: boolean;
+  isTtsDisabled?: boolean;
+  isDmEnabled?: boolean;
+  meetingRequiresInviteCode?: boolean;
+  webinarRole?: "attendee" | "participant" | "host";
+  isWebinarEnabled?: boolean;
+  webinarLocked?: boolean;
+  webinarRequiresInviteCode?: boolean;
+  webinarAttendeeCount?: number;
+  webinarMaxAttendees?: number;
+  recording?: {
+    active: boolean;
+    paused: boolean;
+    startedAt: number | null;
+    available: boolean;
+  };
 }
 
 export interface CreateTransportResponse {
@@ -69,6 +91,7 @@ export interface ConnectTransportData {
 
 export interface RestartIceData {
   transport: "producer" | "consumer";
+  transportId?: string;
 }
 
 export interface RestartIceResponse {
@@ -87,6 +110,7 @@ export interface ProduceResponse {
 }
 
 export interface ConsumeData {
+  transportId?: string;
   producerId: string;
   rtpCapabilities: RtpCapabilities;
 }
@@ -104,6 +128,268 @@ export interface ProducerInfo {
   kind: MediaKind;
   type: "webcam" | "screen";
   paused?: boolean;
+}
+
+export type WebinarFeedMode = "active-speaker";
+
+export interface WebinarConfigSnapshot {
+  enabled: boolean;
+  publicAccess: boolean;
+  locked: boolean;
+  maxAttendees: number;
+  attendeeCount: number;
+  requiresInviteCode: boolean;
+  linkSlug: string | null;
+  feedMode: WebinarFeedMode;
+}
+
+export interface WebinarUpdateRequest {
+  enabled?: boolean;
+  publicAccess?: boolean;
+  locked?: boolean;
+  maxAttendees?: number;
+  inviteCode?: string | null;
+  linkSlug?: string | null;
+}
+
+export interface MeetingConfigSnapshot {
+  requiresInviteCode: boolean;
+}
+
+export interface MeetingUpdateRequest {
+  inviteCode?: string | null;
+}
+
+export type RecordingTrackKind = "audio" | "video" | "screen";
+export type RecordingTrackStatus = "active" | "ended" | "failed";
+
+export interface RecordingTrackArtifact {
+  id: string;
+  trackKind: RecordingTrackKind;
+  producerId: string;
+  producerUserId: string;
+  displayName: string | null;
+  codec: string;
+  container: "webm" | "mp4" | "m4a";
+  filename: string;
+  relativePath: string;
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number;
+  byteSize: number;
+  status: RecordingTrackStatus;
+  errorMessage: string | null;
+}
+
+export type RecordingSessionStatus =
+  | "idle"
+  | "starting"
+  | "active"
+  | "paused"
+  | "finalizing"
+  | "completed"
+  | "failed";
+
+export interface RecordingCompositeArtifact {
+  status: "pending" | "running" | "completed" | "failed";
+  filename: string | null;
+  relativePath: string | null;
+  startedAt: number | null;
+  completedAt: number | null;
+  byteSize: number;
+  errorMessage: string | null;
+}
+
+export interface RecordingSessionMetadata {
+  id: string;
+  roomId: string;
+  clientId: string;
+  scheduledWebinarId: string | null;
+  status: RecordingSessionStatus;
+  startedAt: number;
+  endedAt: number | null;
+  pausedDurationMs: number;
+  startedBy: string;
+  endedBy: string | null;
+  totalBytes: number;
+  resolution: { width: number; height: number } | null;
+  audioBitrateKbps: number;
+  videoBitrateKbps: number;
+  tracks: RecordingTrackArtifact[];
+  composite: RecordingCompositeArtifact | null;
+  manifestPath: string;
+  manifestRelativePath: string;
+  storagePath: string;
+  storageRelativePath: string;
+  errorMessage: string | null;
+  speakerTimeline: { at: number; userId: string | null }[];
+}
+
+export interface RecordingPublicState {
+  active: boolean;
+  paused: boolean;
+  sessionId: string | null;
+  startedAt: number | null;
+  startedBy: string | null;
+  trackCount: number;
+  /**
+   * Whether the SFU has the recording stack online (ffmpeg present and not
+   * disabled via SFU_RECORDING_DISABLED). When false, the web client hides
+   * the record button so hosts don't trigger something that can't run.
+   */
+  available: boolean;
+}
+
+export interface StartRecordingRequest {
+  startedBy?: string;
+  audioBitrateKbps?: number;
+  videoBitrateKbps?: number;
+  preferredVideoCodec?: "h264" | "vp8";
+  composite?: boolean;
+}
+
+export type ScheduledWebinarStatus =
+  | "scheduled"
+  | "live"
+  | "ended"
+  | "cancelled";
+
+export interface ScheduledWebinarCoHost {
+  email: string;
+  name?: string;
+}
+
+export interface ScheduledWebinar {
+  id: string;
+  clientId: string;
+  roomId: string;
+  linkSlug: string;
+  title: string;
+  description: string;
+  hostEmail: string;
+  hostName: string;
+  hostUserId: string | null;
+  coHosts: ScheduledWebinarCoHost[];
+  scheduledStartAt: number;
+  scheduledEndAt: number;
+  status: ScheduledWebinarStatus;
+  publicAccess: boolean;
+  maxAttendees: number;
+  requiresInviteCode: boolean;
+  waitingRoomEnabled: boolean;
+  earlyEntryMinutes: number;
+  qaEnabled: boolean;
+  recordingRequested: boolean;
+  notes: string;
+  createdAt: number;
+  createdBy: string;
+  updatedAt: number;
+  liveStartedAt: number | null;
+  endedAt: number | null;
+  totalJoinCount: number;
+  peakAttendeeCount: number;
+  webinarLink: string;
+  coHostInviteTokenHash: string | null;
+  coHostInviteTokenCreatedAt: number | null;
+}
+
+export interface CreateScheduledWebinarRequest {
+  title: string;
+  description?: string;
+  scheduledStartAt: number;
+  scheduledEndAt?: number;
+  hostEmail?: string;
+  hostName?: string;
+  coHosts?: ScheduledWebinarCoHost[];
+  linkSlug?: string;
+  publicAccess?: boolean;
+  maxAttendees?: number;
+  inviteCode?: string | null;
+  waitingRoomEnabled?: boolean;
+  earlyEntryMinutes?: number;
+  qaEnabled?: boolean;
+  recordingRequested?: boolean;
+  notes?: string;
+}
+
+export interface UpdateScheduledWebinarRequest {
+  title?: string;
+  description?: string;
+  scheduledStartAt?: number;
+  scheduledEndAt?: number;
+  hostEmail?: string;
+  hostName?: string;
+  coHosts?: ScheduledWebinarCoHost[];
+  linkSlug?: string;
+  publicAccess?: boolean;
+  maxAttendees?: number;
+  inviteCode?: string | null;
+  waitingRoomEnabled?: boolean;
+  earlyEntryMinutes?: number;
+  qaEnabled?: boolean;
+  recordingRequested?: boolean;
+  notes?: string;
+  status?: ScheduledWebinarStatus;
+}
+
+export type ScheduledMeetingStatus =
+  | "scheduled"
+  | "live"
+  | "ended"
+  | "cancelled";
+
+export interface ScheduledMeeting {
+  id: string;
+  clientId: string;
+  roomCode: string;
+  title: string;
+  hostEmail: string;
+  hostName: string;
+  hostUserId: string | null;
+  scheduledStartAt: number;
+  scheduledEndAt: number;
+  status: ScheduledMeetingStatus;
+  startedAt: number | null;
+  endedAt: number | null;
+  createdAt: number;
+  createdBy: string;
+  updatedAt: number;
+}
+
+export interface CreateScheduledMeetingRequest {
+  title: string;
+  scheduledStartAt: number;
+  scheduledEndAt?: number;
+  roomCode?: string;
+  hostEmail?: string;
+  hostName?: string;
+}
+
+export interface UpdateScheduledMeetingRequest {
+  title?: string;
+  scheduledStartAt?: number;
+  scheduledEndAt?: number;
+  roomCode?: string;
+  status?: ScheduledMeetingStatus;
+}
+
+export interface WebinarLinkResponse {
+  slug: string;
+  link: string;
+  publicAccess: boolean;
+  linkVersion: number;
+}
+
+export interface WebinarFeedChangedNotification {
+  roomId: string;
+  speakerUserId: string | null;
+  producers: ProducerInfo[];
+}
+
+export interface WebinarAttendeeCountChangedNotification {
+  roomId: string;
+  attendeeCount: number;
+  maxAttendees: number;
 }
 
 export interface ToggleMediaData {
@@ -147,13 +433,16 @@ export interface ChatMessage {
   displayName: string;
   content: string;
   timestamp: number;
+  isDirect?: boolean;
+  dmTargetUserId?: string;
+  dmTargetDisplayName?: string;
 }
 
 export interface SendChatData {
   content: string;
 }
 
-export interface ChatMessageNotification extends ChatMessage { }
+export interface ChatMessageNotification extends ChatMessage {}
 
 // ============================================
 // Reactions
@@ -281,14 +570,14 @@ export interface AppsAwarenessData {
 // ============================================
 
 export const VIDEO_CONSTRAINTS = {
-  maxWidth: 640,
-  maxHeight: 360,
+  maxWidth: 1920,
+  maxHeight: 1080,
   maxFrameRate: 30,
-  maxBitrate: 500000, // 500 kbps for 360p
+  maxBitrate: 5000000,
 } as const;
 
 export const AUDIO_CONSTRAINTS = {
-  maxBitrate: 64000, // 64 kbps for audio
+  maxBitrate: 192000,
 } as const;
 
 // ============================================

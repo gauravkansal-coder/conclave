@@ -11,11 +11,16 @@ import {
   MicOff,
   Plus,
   ArrowRight,
+  CalendarClock,
+  Copy,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { signIn, useSession } from "@/lib/auth-client";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { signIn, signOut, useSession } from "@/lib/auth-client";
 import type { RoomInfo } from "@/lib/sfu-types";
+import type { ScheduledMeeting } from "@/lib/scheduled-meetings";
+import ScheduleMeetingModal from "./ScheduleMeetingModal";
 import type { ConnectionState, MeetError } from "../lib/types";
 import {
   DEFAULT_AUDIO_CONSTRAINTS,
@@ -26,10 +31,41 @@ import {
   ROOM_CODE_MAX_LENGTH,
   extractRoomCode,
   getRoomWordSuggestions,
+  sanitizeInstitutionDisplayName,
   sanitizeRoomCodeInput,
   sanitizeRoomCode,
 } from "../lib/utils";
 import MeetsErrorBanner from "./MeetsErrorBanner";
+
+const normalizeGuestName = (value: string): string =>
+  value.trim().replace(/\s+/g, " ");
+const GUEST_USER_STORAGE_KEY = "conclave:guest-user";
+
+const createGuestId = (): string => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `guest-${crypto.randomUUID()}`;
+  }
+  return `guest-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const buildGuestUser = (
+  name: string,
+  existingUser?: { id?: string; email?: string | null }
+) => {
+  const existingGuestId =
+    typeof existingUser?.id === "string" && existingUser.id.startsWith("guest-")
+      ? existingUser.id
+      : undefined;
+  const existingEmail =
+    typeof existingUser?.email === "string" ? existingUser.email.trim() : "";
+  const id = existingGuestId || createGuestId();
+  const email = existingEmail || `${id}@guest.conclave`;
+  return {
+    id,
+    email,
+    name,
+  };
+};
 
 interface JoinScreenProps {
   roomId: string;
@@ -99,22 +135,28 @@ function JoinScreen({
   const [isMicOn, setIsMicOn] = useState(false); // Start with mic off
   const isRoutedRoom = forceJoinOnly;
   const enforceShortCode = enableRoomRouting || forceJoinOnly;
+  const hasUserIdentity = Boolean(user?.id || user?.email);
   const [activeTab, setActiveTab] = useState<"new" | "join">(() =>
     isRoutedRoom ? "join" : "new"
   );
   const [phase, setPhase] = useState<"welcome" | "auth" | "join">(() => {
-    if (user && user.id && !user.id.startsWith("guest-")) {
+    if (hasUserIdentity) {
       return "join";
     }
     return "welcome";
   });
   const [guestName, setGuestName] = useState("");
+  const [customRoomCode, setCustomRoomCode] = useState("");
+  const [isScheduleOpen, setIsScheduleOpen] = useState(false);
+  const [upcomingMeetings, setUpcomingMeetings] = useState<ScheduledMeeting[]>([]);
+  const [copiedMeetingId, setCopiedMeetingId] = useState<string | null>(null);
   const [signInProvider, setSignInProvider] = useState<
     "google" | "apple" | "roblox" | "vercel" | null
   >(
     null
   );
   const isSigningIn = signInProvider !== null;
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const normalizedSegments = useMemo(
     () => normalizedRoomId.split("-"),
     [normalizedRoomId]
@@ -135,7 +177,27 @@ function JoinScreen({
       : "";
 
   const { data: session } = useSession();
+  const canSignOut = Boolean(session?.user || user?.id || user?.email);
+  const isSignedInUser = Boolean((session?.user || user) && !user?.id?.startsWith("guest-"));
   const lastAppliedSessionUserIdRef = useRef<string | null>(null);
+
+  const [nextParam, setNextParam] = useState<string | null>(null);
+  const hasPushedNextRef = useRef(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const candidate = params.get("next");
+    if (!candidate) return;
+    if (!candidate.startsWith("/") || candidate.startsWith("//")) return;
+    setNextParam(candidate);
+  }, []);
+  useEffect(() => {
+    if (!nextParam) return;
+    if (!session?.user) return;
+    if (hasPushedNextRef.current) return;
+    hasPushedNextRef.current = true;
+    window.location.href = nextParam;
+  }, [nextParam, session]);
 
   useEffect(() => {
     if (!session?.user) {
@@ -143,19 +205,26 @@ function JoinScreen({
       return;
     }
 
-    if (user && !lastAppliedSessionUserIdRef.current) {
+    const isGuestIdentity = Boolean(user?.id?.startsWith("guest-"));
+    if (
+      (!user || isGuestIdentity) &&
+      lastAppliedSessionUserIdRef.current !== session.user.id
+    ) {
+      const sessionUser = {
+        id: session.user.id,
+        email: session.user.email || "",
+        name: sanitizeInstitutionDisplayName(
+          session.user.name || session.user.email || "User",
+          session.user.email || ""
+        ),
+      };
+      onUserChange(sessionUser);
+      setPhase("join");
       lastAppliedSessionUserIdRef.current = session.user.id;
       return;
     }
 
-    if (!user && lastAppliedSessionUserIdRef.current !== session.user.id) {
-      const sessionUser = {
-        id: session.user.id,
-        email: session.user.email || "",
-        name: session.user.name || session.user.email || "User",
-      };
-      onUserChange(sessionUser);
-      setPhase("join");
+    if (user && !isGuestIdentity && !lastAppliedSessionUserIdRef.current) {
       lastAppliedSessionUserIdRef.current = session.user.id;
     }
   }, [session, user, onUserChange]);
@@ -165,13 +234,21 @@ function JoinScreen({
     const prevUser = prevUserRef.current;
     prevUserRef.current = user;
 
-    if (!prevUser && user && user.id && !user.id.startsWith("guest-")) {
+    if (!prevUser && user) {
       setPhase("join");
     }
     if (prevUser && !user) {
       setPhase("welcome");
     }
   }, [user]);
+
+  useEffect(() => {
+    if (!user?.id?.startsWith("guest-")) return;
+    if (guestName.trim().length > 0) return;
+    const nextName = normalizeGuestName(user.name || "");
+    if (!nextName) return;
+    setGuestName(nextName);
+  }, [guestName, user]);
 
   useEffect(() => {
     // Only capture media when in join phase
@@ -265,13 +342,62 @@ function JoinScreen({
 
   const handleCreateRoom = () => {
     onIsAdminChange(true);
-    const id = generateRoomCode();
+    const sanitizedCustomCode = sanitizeRoomCode(customRoomCode);
+    const id =
+      sanitizedCustomCode.length >= 3 ? sanitizedCustomCode : generateRoomCode();
     if (enableRoomRouting && typeof window !== "undefined") {
       window.history.pushState(null, "", `/${id}`);
     }
     onRoomIdChange(id);
     onJoinRoom(id);
   };
+
+  const refreshUpcomingMeetings = useCallback(async () => {
+    if (!isSignedInUser) {
+      setUpcomingMeetings([]);
+      return;
+    }
+    try {
+      const response = await fetch(
+        "/api/meetings/scheduled?status=scheduled,live",
+        { cache: "no-store" },
+      );
+      if (!response.ok) {
+        setUpcomingMeetings([]);
+        return;
+      }
+      const data = (await response.json()) as {
+        scheduledMeetings?: ScheduledMeeting[];
+      };
+      setUpcomingMeetings(data?.scheduledMeetings ?? []);
+    } catch {
+      setUpcomingMeetings([]);
+    }
+  }, [isSignedInUser]);
+
+  useEffect(() => {
+    if (phase !== "join") return;
+    if (activeTab !== "new") return;
+    void refreshUpcomingMeetings();
+  }, [phase, activeTab, refreshUpcomingMeetings]);
+
+  const handleCopyMeetingLink = useCallback(async (meeting: ScheduledMeeting) => {
+    if (typeof window === "undefined") return;
+    const link = `${window.location.origin}/${meeting.roomCode}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedMeetingId(meeting.id);
+      setTimeout(
+        () =>
+          setCopiedMeetingId((current) =>
+            current === meeting.id ? null : current,
+          ),
+        1800,
+      );
+    } catch {
+      setCopiedMeetingId(null);
+    }
+  }, []);
 
   const handleSocialSignIn = async (
     provider: "google" | "apple" | "roblox" | "vercel"
@@ -289,14 +415,48 @@ function JoinScreen({
     }
   };
 
-  const handleGuest = () => {
-    const guestUser = {
-      id: `guest-${Date.now()}`,
-      email: `guest-${guestName}@guest.com`,
-      name: guestName,
+  const handleSignOut = async () => {
+    if (isSigningOut) return;
+    setIsSigningOut(true);
+    const clearGuestStorage = () => {
+      if (typeof window === "undefined") return;
+      window.localStorage.removeItem(GUEST_USER_STORAGE_KEY);
     };
+
+    if (!session?.user) {
+      clearGuestStorage();
+      onUserChange(null);
+      onIsAdminChange(false);
+      setPhase("welcome");
+      setIsSigningOut(false);
+      return;
+    }
+
+    await signOut()
+      .then(() => {
+        clearGuestStorage();
+        onUserChange(null);
+        onIsAdminChange(false);
+        setPhase("welcome");
+      })
+      .catch((error) => {
+        console.error("Sign out error:", error);
+      });
+    setIsSigningOut(false);
+  };
+
+  const handleOpenDeleteAccount = () => {
+    if (typeof window === "undefined") return;
+    window.open("/delete-account", "_blank", "noopener,noreferrer");
+  };
+
+  const handleGuest = () => {
+    const normalizedGuestName = normalizeGuestName(guestName);
+    if (!normalizedGuestName) return;
+    const guestUser = buildGuestUser(normalizedGuestName, user);
     onUserChange(guestUser);
     onIsAdminChange(false);
+    setGuestName(normalizedGuestName);
     setPhase("join");
   };
 
@@ -377,7 +537,7 @@ function JoinScreen({
               className="text-[#FEFCD9]/30 text-sm mb-12 max-w-xs text-center"
               style={{ fontFamily: "'PolySans Trial', sans-serif" }}
             >
-              ACM-VIT's in-house video conferencing platform
+              Video conferencing for meetings, webinars, and collaboration
             </p>
 
             <button
@@ -561,11 +721,35 @@ function JoinScreen({
                     </button>
                   </div>
 
-                  <div
-                    className="absolute top-3 left-3 px-2.5 py-1 bg-black/50 backdrop-blur-sm rounded-full text-[11px] text-[#FEFCD9]/70"
-                    style={{ fontFamily: "'PolySans Mono', monospace" }}
-                  >
-                    {userEmail}
+                  <div className="absolute top-3 left-3 right-3 flex items-start justify-between gap-3">
+                    <div
+                      className="min-w-0 max-w-[70%] px-2.5 py-1 bg-black/50 backdrop-blur-sm rounded-full text-[11px] text-[#FEFCD9]/70 truncate"
+                      style={{ fontFamily: "'PolySans Mono', monospace" }}
+                    >
+                      {userEmail}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {isSignedInUser && (
+                        <button
+                          type="button"
+                          onClick={handleOpenDeleteAccount}
+                          className="shrink-0 h-8 w-8 flex items-center justify-center bg-black/50 backdrop-blur-sm rounded-full text-[#F95F4A] hover:bg-black/70"
+                          aria-label="Delete account"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                      {canSignOut && (
+                        <button
+                          onClick={handleSignOut}
+                          disabled={isSigningOut}
+                          className="shrink-0 px-2.5 py-1 bg-black/50 backdrop-blur-sm rounded-full text-[9px] uppercase tracking-widest text-[#FEFCD9]/70 hover:bg-black/70 disabled:opacity-50"
+                          style={{ fontFamily: "'PolySans Mono', monospace" }}
+                        >
+                          {isSigningOut ? "Signing out..." : "Sign out"}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -591,13 +775,17 @@ function JoinScreen({
                     Camera {isCameraOn ? "On" : "Off"}
                   </div>
                   {onTestSpeaker && (
-                    <button
-                      type="button"
-                      onClick={onTestSpeaker}
-                      className="ml-auto flex items-center gap-2 bg-[#1a1a1a] border border-[#FEFCD9]/10 rounded-full px-3 py-1 text-[#FEFCD9]/70 hover:text-[#FEFCD9] hover:border-[#FEFCD9]/30 transition-colors"
-                    >
-                      Test speaker
-                    </button>
+                    <div className="ml-auto flex items-center gap-2">
+                      {onTestSpeaker && (
+                        <button
+                          type="button"
+                          onClick={onTestSpeaker}
+                          className="flex items-center gap-2 bg-[#1a1a1a] border border-[#FEFCD9]/10 rounded-full px-3 py-1 text-[#FEFCD9]/70 hover:text-[#FEFCD9] hover:border-[#FEFCD9]/30 transition-colors"
+                        >
+                          Test speaker
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -632,6 +820,28 @@ function JoinScreen({
 
                 {activeTab === "new" && !isRoutedRoom ? (
                   <div className="space-y-4">
+                    <div>
+                      <label className="text-[10px] uppercase tracking-wider text-[#FEFCD9]/40 mb-1.5 block" style={{ fontFamily: "'PolySans Mono', monospace" }}>
+                        Custom Code (optional)
+                      </label>
+                      <input
+                        type="text"
+                        value={customRoomCode}
+                        onChange={(e) =>
+                          setCustomRoomCode(sanitizeRoomCodeInput(e.target.value))
+                        }
+                        placeholder="acmvit-cybersec, or leave blank for random"
+                        maxLength={ROOM_CODE_MAX_LENGTH}
+                        disabled={isLoading}
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        className="w-full px-3 py-2.5 bg-[#1a1a1a] border border-[#FEFCD9]/10 rounded-lg text-sm text-[#FEFCD9] placeholder:text-[#FEFCD9]/30 focus:border-[#F95F4A]/50 focus:outline-none"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !isLoading) handleCreateRoom();
+                        }}
+                      />
+                    </div>
                     {isAdmin && allowGhostMode && (
                       <>
                         <div>
@@ -669,6 +879,72 @@ function JoinScreen({
                       {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                       <span className="text-sm" style={{ fontFamily: "'PolySans Trial', sans-serif" }}>Start Meeting</span>
                     </button>
+                    {isSignedInUser && (
+                      <button
+                        type="button"
+                        onClick={() => setIsScheduleOpen(true)}
+                        disabled={isLoading}
+                        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-[#FEFCD9]/15 text-[#FEFCD9]/85 hover:border-[#FEFCD9]/35 hover:text-[#FEFCD9] transition-colors disabled:opacity-50"
+                      >
+                        <CalendarClock className="w-4 h-4" />
+                        <span className="text-sm" style={{ fontFamily: "'PolySans Trial', sans-serif" }}>
+                          Schedule a meeting
+                        </span>
+                      </button>
+                    )}
+                    {isSignedInUser && upcomingMeetings.length > 0 && (
+                      <div className="space-y-1.5 pt-1">
+                        <p
+                          className="text-[10px] uppercase tracking-wider text-[#FEFCD9]/40"
+                          style={{ fontFamily: "'PolySans Mono', monospace" }}
+                        >
+                          Upcoming
+                        </p>
+                        {upcomingMeetings.slice(0, 3).map((meeting) => {
+                          const start = new Date(meeting.scheduledStartAt);
+                          const isToday =
+                            start.toDateString() === new Date().toDateString();
+                          const timeLabel = isToday
+                            ? start.toLocaleTimeString(undefined, {
+                                hour: "numeric",
+                                minute: "2-digit",
+                              })
+                            : start.toLocaleString(undefined, {
+                                month: "short",
+                                day: "numeric",
+                                hour: "numeric",
+                                minute: "2-digit",
+                              });
+                          return (
+                            <div
+                              key={meeting.id}
+                              className="flex items-center gap-2 rounded-lg border border-[#FEFCD9]/10 bg-black/25 px-3 py-2"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs text-[#FEFCD9]/85 truncate">
+                                  {meeting.title}
+                                </p>
+                                <p className="text-[10px] text-[#FEFCD9]/45">
+                                  {timeLabel} · /{meeting.roomCode}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleCopyMeetingLink(meeting)
+                                }
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[#FEFCD9]/55 hover:bg-[#FEFCD9]/10 hover:text-[#FEFCD9] transition-colors"
+                              >
+                                <Copy className="h-3 w-3" />
+                                {copiedMeetingId === meeting.id
+                                  ? "copied"
+                                  : "copy"}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="space-y-4">
@@ -826,6 +1102,14 @@ function JoinScreen({
           </div>
         </div>
       )}
+
+      <ScheduleMeetingModal
+        open={isScheduleOpen}
+        onClose={() => setIsScheduleOpen(false)}
+        onScheduled={(meeting) => {
+          setUpcomingMeetings((prev) => [meeting, ...prev]);
+        }}
+      />
     </div>
   );
 }

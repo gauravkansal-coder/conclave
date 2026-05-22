@@ -2,6 +2,7 @@
 
 import { useCallback } from "react";
 import MeetsClient from "./meets-client";
+import type { JoinMode } from "./lib/types";
 
 const reactionAssets = [
   "aura.gif",
@@ -20,23 +21,48 @@ const readError = async (response: Response) => {
   return response.statusText || "Request failed";
 };
 
-const clientId = process.env.NEXT_PUBLIC_SFU_CLIENT_ID || "public";
-const isPublicClient = clientId === "public";
+const defaultClientId = process.env.NEXT_PUBLIC_SFU_CLIENT_ID || "public";
+const normalizeClientId = (value: string | undefined): string | null => {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  return /^[a-zA-Z0-9._:-]{1,64}$/.test(normalized) ? normalized : null;
+};
 
 type MeetsClientPageProps = {
   initialRoomId?: string;
   forceJoinOnly?: boolean;
+  bypassMediaPermissions?: boolean;
+  broadcastMode?: boolean;
+  sfuClientId?: string;
+  joinMode?: JoinMode;
+  autoJoinOnMount?: boolean;
+  hideJoinUI?: boolean;
   fontClassName?: string;
+  user?: {
+    id?: string;
+    email?: string | null;
+    name?: string | null;
+  };
+  isAdmin?: boolean;
 };
 
 export default function MeetsClientPage({
   initialRoomId,
   forceJoinOnly = false,
+  bypassMediaPermissions = false,
+  broadcastMode = false,
+  sfuClientId,
+  joinMode = "meeting",
+  autoJoinOnMount = false,
+  hideJoinUI = false,
   fontClassName,
+  user,
+  isAdmin = false,
 }: MeetsClientPageProps) {
-  const user = undefined;
-
-  const isAdmin = false;
+  const defaultUser = user;
+  const resolvedIsAdmin = isAdmin;
+  const resolvedClientId = normalizeClientId(sfuClientId) || defaultClientId;
+  const isPublicClient = resolvedClientId === "public";
 
   const getJoinInfo = useCallback(
     async (
@@ -45,22 +71,26 @@ export default function MeetsClientPage({
       options?: {
         user?: { id?: string; email?: string | null; name?: string | null };
         isHost?: boolean;
+        joinMode?: JoinMode;
       }
     ) => {
-      const resolvedUser = options?.user ?? user;
+      const resolvedUser = options?.user ?? defaultUser;
       const isHost = Boolean(options?.isHost);
+      const resolvedJoinMode = options?.joinMode ?? joinMode;
       const response = await fetch("/api/sfu/join", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-sfu-client": clientId,
+          "x-sfu-client": resolvedClientId,
         },
         body: JSON.stringify({
           roomId,
           sessionId,
           user: resolvedUser,
           isHost,
-          clientId,
+          allowRoomCreation: forceJoinOnly,
+          clientId: resolvedClientId,
+          joinMode: resolvedJoinMode,
         }),
       });
 
@@ -70,25 +100,21 @@ export default function MeetsClientPage({
 
       return response.json();
     },
-    [user]
+    [forceJoinOnly, joinMode, defaultUser, resolvedClientId]
   );
 
   const getRooms = useCallback(async () => {
     const response = await fetch("/api/sfu/rooms", {
       cache: "no-store",
-      headers: { "x-sfu-client": clientId },
+      headers: { "x-sfu-client": resolvedClientId },
     });
     if (!response.ok) {
       throw new Error(await readError(response));
     }
     const data = (await response.json()) as { rooms?: unknown };
     return Array.isArray(data?.rooms) ? data.rooms : [];
-  }, []);
+  }, [resolvedClientId]);
 
-  const getRoomsForRedirect = useCallback(
-    async (_roomId: string) => getRooms(),
-    [getRooms]
-  );
 
   const resolvedInitialRoomId =
     initialRoomId ?? (isPublicClient ? "" : "default-room");
@@ -100,12 +126,16 @@ export default function MeetsClientPage({
         enableRoomRouting={isPublicClient}
         forceJoinOnly={forceJoinOnly}
         allowGhostMode={!isPublicClient}
+        bypassMediaPermissions={bypassMediaPermissions}
+        broadcastMode={broadcastMode}
+        joinMode={joinMode}
+        autoJoinOnMount={autoJoinOnMount}
+        hideJoinUI={hideJoinUI}
         getJoinInfo={getJoinInfo}
         getRooms={getRooms}
-        getRoomsForRedirect={getRoomsForRedirect}
         reactionAssets={reactionAssets}
-        user={user}
-        isAdmin={isAdmin}
+        user={defaultUser}
+        isAdmin={resolvedIsAdmin}
         fontClassName={fontClassName}
       />
     </div>

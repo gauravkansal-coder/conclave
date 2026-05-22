@@ -11,8 +11,10 @@ export type ToolKind =
   | "rect"
   | "ellipse"
   | "line"
+  | "arrow"
   | "text"
-  | "sticky";
+  | "sticky"
+  | "pan";
 
 export type ToolSettings = {
   strokeColor: string;
@@ -74,7 +76,7 @@ export class ToolEngine {
       this.activeElementId = null;
       this.dragStart = null;
       this.lastPoint = null;
-      if (tool !== "select") {
+      if (tool !== "select" && tool !== "pan") {
         this.selectedId = null;
       }
     }
@@ -120,12 +122,25 @@ export class ToolEngine {
       return;
     }
 
-    if (this.tool === "rect" || this.tool === "ellipse" || this.tool === "line") {
+    if (
+      this.tool === "rect" ||
+      this.tool === "ellipse" ||
+      this.tool === "line" ||
+      this.tool === "arrow"
+    ) {
       const id = createId();
+      const shape =
+        this.tool === "rect"
+          ? "rect"
+          : this.tool === "ellipse"
+            ? "ellipse"
+            : this.tool === "line"
+              ? "line"
+              : "arrow";
       const element: WhiteboardElement = {
         id,
         type: "shape",
-        shape: this.tool === "rect" ? "rect" : this.tool === "ellipse" ? "ellipse" : "line",
+        shape,
         x: point.x,
         y: point.y,
         width: 0,
@@ -179,6 +194,10 @@ export class ToolEngine {
       return;
     }
 
+    if (this.tool === "pan") {
+      return;
+    }
+
     if (this.tool === "select") {
       const elements = getPageElements(this.doc, this.pageId);
       const hit = [...elements].reverse().find((element) => hitTestElement(element, point));
@@ -193,6 +212,8 @@ export class ToolEngine {
 
   onPointerMove(point: Point) {
     if (!this.dragStart || !this.lastPoint) return;
+
+    if (this.tool === "pan") return;
 
     if (this.tool === "pen" || this.tool === "highlighter") {
       if (!this.activeElementId) return;
@@ -211,7 +232,12 @@ export class ToolEngine {
       return;
     }
 
-    if (this.tool === "rect" || this.tool === "ellipse" || this.tool === "line") {
+    if (
+      this.tool === "rect" ||
+      this.tool === "ellipse" ||
+      this.tool === "line" ||
+      this.tool === "arrow"
+    ) {
       if (!this.activeElementId) return;
       const elements = getPageElements(this.doc, this.pageId);
       const element = elements.find((item) => item.id === this.activeElementId);
@@ -265,7 +291,8 @@ export class ToolEngine {
         this.tool === "highlighter" ||
         this.tool === "rect" ||
         this.tool === "ellipse" ||
-        this.tool === "line")
+        this.tool === "line" ||
+        this.tool === "arrow")
     ) {
       this.selectedId = this.activeElementId;
     }
